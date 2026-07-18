@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""
+innago — CLI wrapper for the Innago Open API.
+
+Reads credentials from environment variables or an optional Agent Vault adapter,
+fetches + caches a 1-hour bearer token (with refresh-token support), and exposes the full Innago Open API surface
+(43 endpoints) as mapped from https://docs.innago.com/reference (authoritative,
+supersedes the integration PDF which had several wrong methods/param names).
+
+Auth flow (per Innago's integration guide):
+  POST /identity/connect/token  grant_type=password
+    username = API client ID
+    password = API client secret
+    client_id / client_secret = the same API credentials
+  -> access_token (1h) + refresh_token (~1mo)
+  On expiry, grant_type=refresh_token mints a new one.
+
+Data-access status: complete service-account credentials mint a token carrying
+the account's PropertyOwnerId, and tested read endpoints return account data.
+Critical gotcha: the Authorization scheme must be uppercase "Bearer" even though
+Innago's PDF examples show lowercase "bearer"; their server treats it as case-sensitive.
+
+Usage examples:
+  innago auth
+  innago token
+  innago properties [--page N]
+  innago property <propertyUid>
+  innago units <propertyUid>
+  innago unit <propertyUid> <unitUid>
+  innago leases [--property <uid>] [--unit <uid>] [--page N]
+  innago lease <leaseUid>
+  innago tenants --lease <leaseUid>
+  innago tenant <tenantUid>
+  innago invoices [--lease <uid>] [--tenant <uid>] [--page N]
+  innago invoice <invoiceUid>
+  innago invoice-create --json '<CreateInvoiceModel>'
+  innago invoice-payments <invoiceUid>
+  innago payments [--month M --year Y --property <uid> --unit <uid> --tenant <uid> --page N]
+  innago payment <paymentUid>
+  innago record-payment <invoiceUid> --json '<RecordPaymentRequestModel>'
+  innago record-tenant-payment <tenantUid> --json '<RecordPaymentForUnitRequestModel>'
+  innago record-bulk-payments --json '[...]'
+  innago payment-status <paymentUid> <statusCode>
+  innago record-ref-payment <externalInvoiceUid> --json '<RecordReferencePaymentRequestModel>'
+  innago transactions [--id <transactionId>]
+  innago transaction-status --id <transactionId> --status <code>
+  innago expenses --json '<GetAllExpensesByFilterRequestModel>'
+  innago maintenance [--status N --category N --tenant <uid> --property <uid> --urgent --page N]
+  innago maintenance-get <maintenanceUid>
+  innago maintenance-create --json '<MaintenanceRequestModel>'
+  innago maintenance-edit <maintenanceUid> --json '<EditMaintenanceRequestModel>'
+  innago maintenance-status <maintenanceUid> <statusCode>
+  innago maintenance-delete <maintenanceUid>
+  innago maintenance-comment <maintenanceUid> --json '<MaintenanceCommentRequestModel>'
+  innago maintenance-email <maintenanceUid> <emailAddress>
+  innago map --json '[...]'                       # map external refs to Innago entities
+  innago ref <entity> <externalReferenceUid>      # includes maintenance-v2
+  innago sync-payments --json '<PaymentSyncRequestModel>'
+  innago sync-invoices --json '[...]'
+  innago sync-status <syncRequestId>
+  innago health
+  innago raw <METHOD> <path> [--json '<body>']    # escape hatch
+
+Global flags (BEFORE the subcommand): --raw  --debug
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import urllib.error
+
+BASE_URL = "https://api-my.innago.com/openapi"
+TOKEN_URL = "https://api-my.innago.com/identity/connect/token"
+CACHE_PATH = os.path.expanduser("~/.cache/innago/token.json")
+CONFIG_PATH = os.path.expanduser("~/.config/innago/config.json")
+EXPIRY_SKEW_SECONDS = 120
+
+
+class TokenRequestError(RuntimeError):
+    """A recoverable token-exchange failure."""
+
+
+# --------------------------------------------------------------------------- #
+# Credentials
+# --------------------------------------------------------------------------- #
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as error:
+        die(f"invalid config at {CONFIG_PATH}: {error}")
+
+
+def credential_get(key):
+    value = os.getenv(key)
+    if value:
+        return value
+
+    vault = os.getenv("INNAGO_AGENT_VAULT") or load_config().get("agent_vault")
+    if not vault:
+        die(
+            f"missing {key}: set it as an environment variable or configure "
+            f"agent_vault in {CONFIG_PATH}"
+        )
+    if not shutil.which("agent-vault"):
+        die("agent-vault is configured but not installed on PATH")
+
+    try:
+        out = subprocess.run(
+            ["agent-vault", "vault", "credential", "get", key, "--vault", vault],
+            capture_output=True, text=True, check=True,
+        )
+        return out.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        die(f"credential lookup for {key} failed: {e.stderr.strip() or e}")
+
+
+def creds():
+    return {
+        "client_id": credential_get("INNAGO_CLIENT_ID"),
+        "client_secret": credential_get("INNAGO_CLIENT_SECRET"),
+        "x_api_key": credential_get("INNAGO_X_API_KEY"),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Token cache + exchange
+# --------------------------------------------------------------------------- #
+
+def load_cache():
+    try:
+        with open(CACHE_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_cache(data):
+    os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+    with open(CACHE_PATH, "w") as f:
+        json.dump(data, f)
+    os.chmod(CACHE_PATH, 0o600)
+
+
+def token_valid(cache):
+    return (cache.get("access_token")
+            and cache.get("expires_at", 0) > time.time() + EXPIRY_SKEW_SECONDS)
+
+
+def build_token_payload(c, refresh_token=None):
+    if refresh_token:
+        return {"refresh_token": refresh_token, "client_id": c["client_id"],
+                "grant_type": "refresh_token", "client_secret": c["client_secret"]}
+    return {"username": c["client_id"], "password": c["client_secret"],
+            "client_id": c["client_id"], "grant_type": "password",
+            "client_secret": c["client_secret"]}
+
+
+def mint_token(debug=False, use_refresh=False, recoverable=False):
+    c = creds()
+    cache = load_cache()
+    refresh_token = cache.get("refresh_token") if use_refresh else None
+    payload = build_token_payload(c, refresh_token=refresh_token)
+    data = urllib.parse.urlencode(payload).encode()
+
+    req = urllib.request.Request(TOKEN_URL, data=data, method="POST")
+    req.add_header("Accept", "application/json")
+    req.add_header("x-api-key", c["x_api_key"])
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+    if debug:
+        red = dict(payload)
+        for k in ("password", "client_secret", "refresh_token"):
+            if k in red:
+                red[k] = red[k][:4] + "…"
+        print(f"[debug] POST {TOKEN_URL}\n[debug] payload: {red}", file=sys.stderr)
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            body = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        message = f"token request failed: HTTP {e.code}\n{e.read().decode(errors='ignore')}"
+        if recoverable:
+            raise TokenRequestError(message) from e
+        die(message)
+    except urllib.error.URLError as e:
+        message = f"token network error: {e}"
+        if recoverable:
+            raise TokenRequestError(message) from e
+        die(message)
+
+    access = body.get("access_token")
+    if not access:
+        message = f"no access_token in response: {json.dumps(body)}"
+        if recoverable:
+            raise TokenRequestError(message)
+        die(message)
+    new_cache = {
+        "access_token": access,
+        "expires_at": time.time() + int(body.get("expires_in", 3600)),
+        "refresh_token": body.get("refresh_token", cache.get("refresh_token")),
+    }
+    save_cache(new_cache)
+    return new_cache
+
+
+def get_token(debug=False):
+    cache = load_cache()
+    if token_valid(cache):
+        return cache["access_token"]
+    if cache.get("refresh_token"):
+        try:
+            return mint_token(debug=debug, use_refresh=True, recoverable=True)["access_token"]
+        except TokenRequestError as error:
+            if debug:
+                print(f"[debug] refresh failed; falling back to password grant: {error}", file=sys.stderr)
+    return mint_token(debug=debug)["access_token"]
+
+
+# --------------------------------------------------------------------------- #
+# API request
+# --------------------------------------------------------------------------- #
+
+def api_request(method, path, query=None, body=None, debug=False):
+    c = creds()
+    token = get_token(debug=debug)
+    url = BASE_URL + path
+    if query:
+        clean = {k: v for k, v in query.items() if v is not None}
+        if clean:
+            url += "?" + urllib.parse.urlencode(clean)
+
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("accept", "application/json")
+    req.add_header("x-api-key", c["x_api_key"])
+    # Innago's OpenAPI implementation incorrectly treats the auth scheme as
+    # case-sensitive. The PDF examples use lowercase "bearer", which returns
+    # 401 Unauthorized. RFC-correct "Bearer" succeeds.
+    req.add_header("Authorization", f"Bearer {token}")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+
+    if debug:
+        print(f"[debug] {method} {url}", file=sys.stderr)
+        if body is not None:
+            print(f"[debug] body: {json.dumps(body)}", file=sys.stderr)
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read().decode()
+            if debug:
+                print(f"[debug] HTTP {resp.status}", file=sys.stderr)
+            if not raw.strip():
+                return {"status": resp.status, "body": None}
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return {"status": resp.status, "body": raw}
+    except urllib.error.HTTPError as e:
+        die(f"{method} {path} failed: HTTP {e.code}\n{e.read().decode(errors='ignore')}")
+    except urllib.error.URLError as e:
+        die(f"{method} {path} network error: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# Output helpers
+# --------------------------------------------------------------------------- #
+
+def emit(obj, raw=False):
+    print(json.dumps(obj) if raw else json.dumps(obj, indent=2))
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_json_arg(s, what="body"):
+    if s is None:
+        die(f"--json {what} required")
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError as e:
+        die(f"invalid --json: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# Command handlers
+# --------------------------------------------------------------------------- #
+
+def cmd_auth(a):
+    cache = mint_token(debug=a.debug)
+    print(f"ok — token cached, valid ~{int(cache['expires_at'] - time.time())}s")
+    if cache.get("refresh_token"):
+        print("refresh token stored (~1 month)")
+
+
+def cmd_token(a):
+    print(get_token(debug=a.debug))
+
+
+def cmd_health(a):
+    emit(api_request("GET", "/v1/health", debug=a.debug), a.raw)
+
+
+# --- Property ---
+def cmd_properties(a):
+    emit(api_request("GET", "/v1/properties", query={"pageNumber": a.page}, debug=a.debug), a.raw)
+
+def cmd_property(a):
+    emit(api_request("GET", f"/v1/properties/{a.property_uid}", debug=a.debug), a.raw)
+
+def cmd_units(a):
+    emit(api_request("GET", f"/v1/properties/{a.property_uid}/units", debug=a.debug), a.raw)
+
+def cmd_unit(a):
+    emit(api_request("GET", f"/v1/properties/{a.property_uid}/units/{a.unit_uid}", debug=a.debug), a.raw)
+
+# --- Lease ---
+def cmd_leases(a):
+    emit(api_request("GET", "/v1/leases",
+                     query={"propertyUid": a.property, "unitUid": a.unit, "pageNumber": a.page},
+                     debug=a.debug), a.raw)
+
+def cmd_lease(a):
+    emit(api_request("GET", f"/v1/leases/{a.lease_uid}", debug=a.debug), a.raw)
+
+# --- Tenant ---
+def cmd_tenants(a):
+    emit(api_request("GET", "/v1/tenants", query={"leaseUid": a.lease}, debug=a.debug), a.raw)
+
+def cmd_tenant(a):
+    emit(api_request("GET", f"/v1/tenants/{a.tenant_uid}", debug=a.debug), a.raw)
+
+# --- Invoice ---
+def cmd_invoices(a):
+    emit(api_request("GET", "/v1/invoices",
+                     query={"leaseUid": a.lease, "tenantUid": a.tenant, "pageNumber": a.page},
+                     debug=a.debug), a.raw)
+
+def cmd_invoice(a):
+    emit(api_request("GET", f"/v1/invoices/{a.invoice_uid}", debug=a.debug), a.raw)
+
+def cmd_invoice_create(a):
+    emit(api_request("POST", "/v1/invoices", body=load_json_arg(a.json, "CreateInvoiceModel"), debug=a.debug), a.raw)
+
+def cmd_invoice_payments(a):
+    emit(api_request("GET", f"/v1/invoices/{a.invoice_uid}/payments", debug=a.debug), a.raw)
+
+# --- Payments ---
+def cmd_payments(a):
+    q = {"DueInMonth": a.month, "DueInYear": a.year, "PropertyUid": a.property,
+         "PropertyUnitUid": a.unit, "TenantUid": a.tenant, "PageNumber": a.page}
+    emit(api_request("GET", "/v1/payments", query=q, debug=a.debug), a.raw)
+
+def cmd_payment(a):
+    emit(api_request("GET", f"/v1/payments/{a.payment_uid}", debug=a.debug), a.raw)
+
+def cmd_record_payment(a):
+    emit(api_request("POST", f"/v1/invoices/{a.invoice_uid}/payments",
+                     body=load_json_arg(a.json, "RecordPaymentRequestModel"), debug=a.debug), a.raw)
+
+def cmd_record_tenant_payment(a):
+    emit(api_request("POST", f"/v1/tenants/{a.tenant_uid}/payments",
+                     body=load_json_arg(a.json, "RecordPaymentForUnitRequestModel"), debug=a.debug), a.raw)
+
+def cmd_record_bulk_payments(a):
+    emit(api_request("POST", "/v1/tenants/payments",
+                     body=load_json_arg(a.json, "payments array"), debug=a.debug), a.raw)
+
+def cmd_payment_status(a):
+    emit(api_request("PATCH", f"/v1/payments/{a.payment_uid}/status/{a.status_code}", debug=a.debug), a.raw)
+
+def cmd_record_ref_payment(a):
+    emit(api_request("POST", f"/v1/externalreferences/invoices/{a.external_invoice_uid}/payments",
+                     body=load_json_arg(a.json, "RecordReferencePaymentRequestModel"), debug=a.debug), a.raw)
+
+# --- Transactions ---
+def cmd_transactions(a):
+    emit(api_request("GET", "/v1/transactions", query={"transactionId": a.id}, debug=a.debug), a.raw)
+
+def cmd_transaction_status(a):
+    emit(api_request("PATCH", "/v1/transactions/status",
+                     query={"transactionId": a.id, "transactionStatus": a.status}, debug=a.debug), a.raw)
+
+# --- Expenses ---
+def cmd_expenses(a):
+    # This is a read operation despite being POST; Innago accepts an empty
+    # filter model to return all expenses.
+    body = load_json_arg(a.json, "GetAllExpensesByFilterRequestModel") if a.json else {}
+    emit(api_request("POST", "/v1/expenses", body=body, debug=a.debug), a.raw)
+
+# --- Maintenance ---
+def cmd_maintenance(a):
+    q = {"Statuses": a.status, "MaintenanceCategory": a.category, "TenantUid": a.tenant,
+         "PropertyUid": a.property, "IsUrgent": "true" if a.urgent else None, "PageNumber": a.page}
+    emit(api_request("GET", "/v2/maintenances", query=q, debug=a.debug), a.raw)
+
+def cmd_maintenance_get(a):
+    emit(api_request("GET", f"/v2/maintenances/{a.maintenance_uid}", debug=a.debug), a.raw)
+
+def cmd_maintenance_create(a):
+    emit(api_request("POST", "/v2/maintenances",
+                     body=load_json_arg(a.json, "MaintenanceRequestModel"), debug=a.debug), a.raw)
+
+def cmd_maintenance_edit(a):
+    emit(api_request("PUT", f"/v2/maintenances/{a.maintenance_uid}",
+                     body=load_json_arg(a.json, "EditMaintenanceRequestModel"), debug=a.debug), a.raw)
+
+def cmd_maintenance_status(a):
+    emit(api_request("PATCH", f"/v2/maintenances/{a.maintenance_uid}/status/{a.status_code}", debug=a.debug), a.raw)
+
+def cmd_maintenance_delete(a):
+    emit(api_request("DELETE", f"/v2/maintenances/{a.maintenance_uid}", debug=a.debug), a.raw)
+
+def cmd_maintenance_comment(a):
+    emit(api_request("POST", f"/v1/maintenances/{a.maintenance_uid}/comments",
+                     body=load_json_arg(a.json, "MaintenanceCommentRequestModel"), debug=a.debug), a.raw)
+
+def cmd_maintenance_email(a):
+    emit(api_request("POST", f"/v2/maintenances/{a.maintenance_uid}/emails/{a.email}", debug=a.debug), a.raw)
+
+# --- External references / mapping ---
+def cmd_map(a):
+    emit(api_request("PUT", "/v1/map", body=load_json_arg(a.json, "map array"), debug=a.debug), a.raw)
+
+REF_ENTITIES = {"property", "propertyunit", "lease", "tenant", "invoice", "payment", "maintenance", "maintenance-v2"}
+def cmd_ref(a):
+    if a.entity not in REF_ENTITIES:
+        die(f"entity must be one of: {', '.join(sorted(REF_ENTITIES))}")
+    if a.entity == "maintenance-v2":
+        path = f"/v2/externalreferences/maintenance/{a.external_uid}"
+    else:
+        path = f"/v1/externalreferences/{a.entity}/{a.external_uid}"
+    emit(api_request("GET", path, debug=a.debug), a.raw)
+
+# --- Sync ---
+def cmd_sync_payments(a):
+    emit(api_request("PUT", "/v1/syncrequests",
+                     body=load_json_arg(a.json, "PaymentSyncRequestModel"), debug=a.debug), a.raw)
+
+def cmd_sync_invoices(a):
+    emit(api_request("POST", "/v1/invoicesyncrequests",
+                     body=load_json_arg(a.json, "invoice sync array"), debug=a.debug), a.raw)
+
+def cmd_sync_status(a):
+    emit(api_request("GET", f"/v1/syncrequests/{a.sync_request_id}", debug=a.debug), a.raw)
+
+# --- Raw escape hatch ---
+def cmd_raw(a):
+    body = json.loads(a.json) if a.json else None
+    emit(api_request(a.method.upper(), a.path, body=body, debug=a.debug), a.raw)
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="innago", description="Innago Open API CLI")
+    p.add_argument("--raw", action="store_true", help="raw JSON output")
+    p.add_argument("--debug", action="store_true", help="print request details")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("auth").set_defaults(func=cmd_auth)
+    sub.add_parser("token").set_defaults(func=cmd_token)
+    sub.add_parser("health").set_defaults(func=cmd_health)
+
+    # Property
+    sp = sub.add_parser("properties"); sp.add_argument("--page", type=int, default=1); sp.set_defaults(func=cmd_properties)
+    sp = sub.add_parser("property"); sp.add_argument("property_uid"); sp.set_defaults(func=cmd_property)
+    sp = sub.add_parser("units"); sp.add_argument("property_uid"); sp.set_defaults(func=cmd_units)
+    sp = sub.add_parser("unit"); sp.add_argument("property_uid"); sp.add_argument("unit_uid"); sp.set_defaults(func=cmd_unit)
+
+    # Lease
+    sp = sub.add_parser("leases"); sp.add_argument("--property"); sp.add_argument("--unit"); sp.add_argument("--page", type=int, default=1); sp.set_defaults(func=cmd_leases)
+    sp = sub.add_parser("lease"); sp.add_argument("lease_uid"); sp.set_defaults(func=cmd_lease)
+
+    # Tenant
+    sp = sub.add_parser("tenants"); sp.add_argument("--lease", required=True); sp.set_defaults(func=cmd_tenants)
+    sp = sub.add_parser("tenant"); sp.add_argument("tenant_uid"); sp.set_defaults(func=cmd_tenant)
+
+    # Invoice
+    sp = sub.add_parser("invoices"); sp.add_argument("--lease"); sp.add_argument("--tenant"); sp.add_argument("--page", type=int, default=1); sp.set_defaults(func=cmd_invoices)
+    sp = sub.add_parser("invoice"); sp.add_argument("invoice_uid"); sp.set_defaults(func=cmd_invoice)
+    sp = sub.add_parser("invoice-create"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_invoice_create)
+    sp = sub.add_parser("invoice-payments"); sp.add_argument("invoice_uid"); sp.set_defaults(func=cmd_invoice_payments)
+
+    # Payments
+    sp = sub.add_parser("payments")
+    sp.add_argument("--month"); sp.add_argument("--year"); sp.add_argument("--property")
+    sp.add_argument("--unit"); sp.add_argument("--tenant"); sp.add_argument("--page", type=int, default=1)
+    sp.set_defaults(func=cmd_payments)
+    sp = sub.add_parser("payment"); sp.add_argument("payment_uid"); sp.set_defaults(func=cmd_payment)
+    sp = sub.add_parser("record-payment"); sp.add_argument("invoice_uid"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_record_payment)
+    sp = sub.add_parser("record-tenant-payment"); sp.add_argument("tenant_uid"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_record_tenant_payment)
+    sp = sub.add_parser("record-bulk-payments"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_record_bulk_payments)
+    sp = sub.add_parser("payment-status"); sp.add_argument("payment_uid"); sp.add_argument("status_code"); sp.set_defaults(func=cmd_payment_status)
+    sp = sub.add_parser("record-ref-payment"); sp.add_argument("external_invoice_uid"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_record_ref_payment)
+
+    # Transactions
+    sp = sub.add_parser("transactions"); sp.add_argument("--id"); sp.set_defaults(func=cmd_transactions)
+    sp = sub.add_parser("transaction-status"); sp.add_argument("--id", required=True); sp.add_argument("--status", required=True); sp.set_defaults(func=cmd_transaction_status)
+
+    # Expenses
+    sp = sub.add_parser("expenses"); sp.add_argument("--json"); sp.set_defaults(func=cmd_expenses)
+
+    # Maintenance
+    sp = sub.add_parser("maintenance")
+    sp.add_argument("--status"); sp.add_argument("--category"); sp.add_argument("--tenant")
+    sp.add_argument("--property"); sp.add_argument("--urgent", action="store_true"); sp.add_argument("--page", type=int, default=1)
+    sp.set_defaults(func=cmd_maintenance)
+    sp = sub.add_parser("maintenance-get"); sp.add_argument("maintenance_uid"); sp.set_defaults(func=cmd_maintenance_get)
+    sp = sub.add_parser("maintenance-create"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_maintenance_create)
+    sp = sub.add_parser("maintenance-edit"); sp.add_argument("maintenance_uid"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_maintenance_edit)
+    sp = sub.add_parser("maintenance-status"); sp.add_argument("maintenance_uid"); sp.add_argument("status_code"); sp.set_defaults(func=cmd_maintenance_status)
+    sp = sub.add_parser("maintenance-delete"); sp.add_argument("maintenance_uid"); sp.set_defaults(func=cmd_maintenance_delete)
+    sp = sub.add_parser("maintenance-comment"); sp.add_argument("maintenance_uid"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_maintenance_comment)
+    sp = sub.add_parser("maintenance-email"); sp.add_argument("maintenance_uid"); sp.add_argument("email"); sp.set_defaults(func=cmd_maintenance_email)
+
+    # External refs / mapping
+    sp = sub.add_parser("map"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_map)
+    sp = sub.add_parser("ref"); sp.add_argument("entity"); sp.add_argument("external_uid"); sp.set_defaults(func=cmd_ref)
+
+    # Sync
+    sp = sub.add_parser("sync-payments"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_sync_payments)
+    sp = sub.add_parser("sync-invoices"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_sync_invoices)
+    sp = sub.add_parser("sync-status"); sp.add_argument("sync_request_id"); sp.set_defaults(func=cmd_sync_status)
+
+    # Raw
+    sp = sub.add_parser("raw"); sp.add_argument("method"); sp.add_argument("path"); sp.add_argument("--json"); sp.set_defaults(func=cmd_raw)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
