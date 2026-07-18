@@ -142,6 +142,12 @@ Commands that create, alter, record, reject, cancel, sync, or delete data are re
 
 Dedicated delete commands require repeating the target ID with `--confirm`. Generic `raw` commands require `--confirm-write` for non-read HTTP methods. Known invoice-delete portal paths are blocked from `portal raw` entirely so they cannot bypass the stronger confirmation check.
 
+## Agent skill
+
+A portable agent skill ships in [`skills/innago/SKILL.md`](skills/innago/SKILL.md). It teaches agents to prefer sanctioned OpenAPI, use portal endpoints only for gaps, confirm writes, read changes back, and avoid Innago-specific traps such as month-to-month invoice regeneration.
+
+Copy the skill into your agent's skill directory, or point your agent framework at this repository's `skills/innago/` folder. Will's live installation is maintained from the canonical `wv-agent-skills` repository and mirrored here for CLI users.
+
 ## Development
 
 ```bash
