@@ -67,13 +67,20 @@ Usage examples:
   innago sync-status <syncRequestId>
   innago health
   innago raw <METHOD> <path> [--json '<body>']    # escape hatch
+  innago portal login                              # opens real Innago login
+  innago portal capture                            # saves only Innago tokens
+  innago portal invoice-get <numericInvoiceId>
+  innago portal invoice-delete <id> --confirm <id>
+  innago portal raw <METHOD> <path> [--json '<body>']
 
 Global flags (BEFORE the subcommand): --raw  --debug
 """
 
 import argparse
+import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -83,10 +90,14 @@ import urllib.request
 import urllib.error
 
 BASE_URL = "https://api-my.innago.com/openapi"
+PORTAL_BASE_URL = "https://api-my.innago.com"
 TOKEN_URL = "https://api-my.innago.com/identity/connect/token"
 CACHE_PATH = os.path.expanduser("~/.cache/innago/token.json")
+PORTAL_CACHE_PATH = os.path.expanduser("~/.cache/innago/portal.json")
 CONFIG_PATH = os.path.expanduser("~/.config/innago/config.json")
 EXPIRY_SKEW_SECONDS = 120
+PORTAL_LOGIN_URL = "https://my.innago.com/"
+PORTAL_SESSION = "innago-portal-login"
 
 
 class TokenRequestError(RuntimeError):
@@ -188,7 +199,7 @@ def mint_token(debug=False, use_refresh=False, recoverable=False):
         red = dict(payload)
         for k in ("password", "client_secret", "refresh_token"):
             if k in red:
-                red[k] = red[k][:4] + "…"
+                red[k] = "***"
         print(f"[debug] POST {TOKEN_URL}\n[debug] payload: {red}", file=sys.stderr)
 
     try:
@@ -281,6 +292,142 @@ def api_request(method, path, query=None, body=None, debug=False):
         die(f"{method} {path} failed: HTTP {e.code}\n{e.read().decode(errors='ignore')}")
     except urllib.error.URLError as e:
         die(f"{method} {path} network error: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# Optional private portal adapter
+# --------------------------------------------------------------------------- #
+
+def jwt_claims(token):
+    """Decode unverified JWT claims for expiry/status display only."""
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return json.loads(base64.urlsafe_b64decode(part).decode())
+    except (IndexError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def save_portal_cache(data):
+    os.makedirs(os.path.dirname(PORTAL_CACHE_PATH), exist_ok=True)
+    with open(PORTAL_CACHE_PATH, "w") as f:
+        json.dump(data, f)
+    os.chmod(PORTAL_CACHE_PATH, 0o600)
+
+
+def load_portal_cache():
+    try:
+        with open(PORTAL_CACHE_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def portal_cache_from_tokens(access_token, api_token):
+    if access_token.startswith("Bearer "):
+        access_token = access_token[7:]
+    claims = jwt_claims(access_token)
+    cache = {
+        "access_token": access_token,
+        "api_token": api_token,
+        "expires_at": claims.get("exp", 0),
+        "captured_at": int(time.time()),
+    }
+    save_portal_cache(cache)
+    return cache
+
+
+def portal_import_state(path):
+    """Extract only Innago's two required cookies from Playwright state."""
+    try:
+        with open(os.path.expanduser(path)) as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        die(f"Playwright state not found: {path}")
+    except json.JSONDecodeError as error:
+        die(f"invalid Playwright state: {error}")
+
+    cookies = {c.get("name"): c.get("value", "") for c in state.get("cookies", [])
+               if c.get("domain", "").endswith("innago.com")}
+    access = cookies.get("AuthorizationToken_prod") or cookies.get("AuthorizationToken")
+    api_token = cookies.get("APIToken_prod") or cookies.get("InnagoToken")
+    if not access or not api_token:
+        die("state does not contain a logged-in Innago portal session")
+    return portal_cache_from_tokens(access, api_token)
+
+
+def parse_playwright_cookie(output, name):
+    prefix = name + "="
+    if not output.startswith(prefix):
+        return None
+    value = output[len(prefix):]
+    marker = " (domain:"
+    return value.split(marker, 1)[0] if marker in value else value
+
+
+def playwright_cookie(session, name):
+    result = subprocess.run(
+        ["playwright-cli", f"-s={session}", "--raw", "cookie-get", name],
+        capture_output=True, text=True,
+    )
+    if result.returncode:
+        return None
+    return parse_playwright_cookie(result.stdout.strip(), name)
+
+
+def validate_portal_session_name(session):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", session):
+        die("portal session name must start with a letter or number and contain only letters, numbers, underscores, and hyphens")
+    return session
+
+
+def get_portal_cache():
+    cache = load_portal_cache()
+    if not cache.get("access_token") or not cache.get("api_token"):
+        die("portal login required: run `innago portal login`, sign in, then `innago portal capture`")
+    if cache.get("expires_at", 0) <= time.time() + EXPIRY_SKEW_SECONDS:
+        die("portal session expired: run `innago portal login`, sign in, then `innago portal capture`")
+    return cache
+
+
+def portal_request(method, path, query=None, body=None, debug=False):
+    if not path.startswith("/") or path.startswith("//"):
+        die("portal path must begin with one slash")
+    cache = get_portal_cache()
+    url = PORTAL_BASE_URL + path
+    if query:
+        clean = {k: v for k, v in query.items() if v is not None}
+        if clean:
+            url += "?" + urllib.parse.urlencode(clean)
+
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Accept", "application/json")
+    req.add_header("Authorization", f"Bearer {cache['access_token']}")
+    req.add_header("Token", cache["api_token"])
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+
+    if debug:
+        print(f"[debug] portal {method} {url}", file=sys.stderr)
+        if body is not None:
+            print(f"[debug] body: {json.dumps(body)}", file=sys.stderr)
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read().decode()
+            if not raw.strip():
+                return {"status": resp.status, "body": None}
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return {"status": resp.status, "body": raw}
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            die("portal session rejected; run `innago portal login`, sign in, then `innago portal capture`")
+        die(f"portal {method} {path} failed: HTTP {error.code}\n{error.read().decode(errors='ignore')}")
+    except urllib.error.URLError as error:
+        die(f"portal {method} {path} network error: {error}")
 
 
 # --------------------------------------------------------------------------- #
@@ -504,6 +651,82 @@ def cmd_sync_invoices(a):
 def cmd_sync_status(a):
     emit(api_request("GET", f"/v1/syncrequests/{a.sync_request_id}", debug=a.debug), a.raw)
 
+
+# --- Optional private portal adapter ---
+def cmd_portal_login(a):
+    if not shutil.which("playwright-cli"):
+        die("playwright-cli is required for portal login; see https://github.com/microsoft/playwright-cli")
+    session = validate_portal_session_name(a.session)
+    command = ["playwright-cli", f"-s={session}", "open", PORTAL_LOGIN_URL,
+               "--browser=chrome", "--headed"]
+    try:
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as error:
+        die(f"could not open Innago login browser: {error}")
+    print("Innago login opened. Sign in, then run:")
+    print(f"  innago portal capture --session {session}")
+
+
+def cmd_portal_capture(a):
+    if not shutil.which("playwright-cli"):
+        die("playwright-cli is required for portal capture")
+    session = validate_portal_session_name(a.session)
+    access = (playwright_cookie(session, "AuthorizationToken_prod")
+              or playwright_cookie(session, "AuthorizationToken"))
+    api_token = (playwright_cookie(session, "APIToken_prod")
+                 or playwright_cookie(session, "InnagoToken"))
+    if not access or not api_token:
+        die(f"session {session!r} is not logged into Innago")
+    cache = portal_cache_from_tokens(access, api_token)
+    if not a.keep_open:
+        subprocess.run(["playwright-cli", f"-s={session}", "close"],
+                       capture_output=True, text=True)
+    remaining = max(0, int(cache.get("expires_at", 0) - time.time()))
+    print(f"ok — portal session cached, valid ~{remaining}s")
+
+
+def cmd_portal_import_state(a):
+    cache = portal_import_state(a.path)
+    remaining = max(0, int(cache.get("expires_at", 0) - time.time()))
+    print(f"ok — portal session imported, valid ~{remaining}s")
+
+
+def cmd_portal_auth(a):
+    cache = get_portal_cache()
+    claims = jwt_claims(cache["access_token"])
+    result = {
+        "authenticated": True,
+        "expiresAt": cache.get("expires_at"),
+        "expiresInSeconds": max(0, int(cache.get("expires_at", 0) - time.time())),
+        "propertyOwnerId": claims.get("https://my.innago.com/PropertyOwnerId"),
+        "organizationId": claims.get("https://my.innago.com/OrganizationId"),
+    }
+    emit(result, a.raw)
+
+
+def cmd_portal_invoice_get(a):
+    emit(portal_request("GET", "/api/Finance/Invoice_v1/GetInvoiceDetails",
+                        query={"invoiceId": a.invoice_id}, debug=a.debug), a.raw)
+
+
+def cmd_portal_invoice_delete(a):
+    expected = str(a.invoice_id)
+    if a.confirm != expected:
+        die(f"refusing delete: pass --confirm {expected}")
+    # Innago's own portal uses GET for this destructive action. This endpoint
+    # is private and browser-session authenticated, not part of OpenAPI.
+    result = portal_request("GET", "/api/Finance/InvoiceDelete/DeleteInvoiceById",
+                            query={"invoiceId": a.invoice_id}, debug=a.debug)
+    emit({"invoiceId": a.invoice_id, "deleted": True, "response": result}, a.raw)
+
+
+def cmd_portal_raw(a):
+    if "/InvoiceDelete/" in a.path:
+        die("use `innago portal invoice-delete <id> --confirm <id>` for invoice deletion")
+    body = load_json_arg(a.json) if a.json else None
+    emit(portal_request(a.method.upper(), a.path, body=body, debug=a.debug), a.raw)
+
+
 # --- Raw escape hatch ---
 def cmd_raw(a):
     body = json.loads(a.json) if a.json else None
@@ -611,6 +834,27 @@ def build_parser():
 
     # Raw
     sp = sub.add_parser("raw"); sp.add_argument("method"); sp.add_argument("path"); sp.add_argument("--json"); sp.set_defaults(func=cmd_raw)
+
+    # Optional browser-session portal adapter. Private/undocumented endpoints
+    # stay isolated from the sanctioned OpenAPI command surface.
+    portal = sub.add_parser("portal", help="experimental private portal adapter")
+    portal_sub = portal.add_subparsers(dest="portal_cmd", required=True)
+    sp = portal_sub.add_parser("login", help="open Innago's real login in Chrome")
+    sp.add_argument("--session", default=PORTAL_SESSION); sp.set_defaults(func=cmd_portal_login)
+    sp = portal_sub.add_parser("capture", help="cache only the Innago tokens from a login session")
+    sp.add_argument("--session", default=PORTAL_SESSION); sp.add_argument("--keep-open", action="store_true")
+    sp.set_defaults(func=cmd_portal_capture)
+    sp = portal_sub.add_parser("import-state", help="import tokens from Playwright storage state")
+    sp.add_argument("path"); sp.set_defaults(func=cmd_portal_import_state)
+    portal_sub.add_parser("auth", help="show portal token status without printing tokens").set_defaults(func=cmd_portal_auth)
+    sp = portal_sub.add_parser("invoice-get", help="read an invoice through the private portal API")
+    sp.add_argument("invoice_id", type=int); sp.set_defaults(func=cmd_portal_invoice_get)
+    sp = portal_sub.add_parser("invoice-delete", help="delete an invoice through the private portal API")
+    sp.add_argument("invoice_id", type=int); sp.add_argument("--confirm", required=True)
+    sp.set_defaults(func=cmd_portal_invoice_delete)
+    sp = portal_sub.add_parser("raw", help="call another private portal path")
+    sp.add_argument("method"); sp.add_argument("path"); sp.add_argument("--json")
+    sp.set_defaults(func=cmd_portal_raw)
 
     return p
 
