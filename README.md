@@ -1,12 +1,14 @@
 # innago-cli
 
-Command-line client for Innago's sanctioned Open API. It authenticates with service credentials, caches and refreshes OAuth tokens, and exposes all 43 endpoints documented at [docs.innago.com/reference](https://docs.innago.com/reference).
+Command-line client for Innago's sanctioned Open API. It authenticates with service credentials, caches and refreshes OAuth tokens, and exposes 57 operations from Innago's live Swagger spec plus the documented health endpoint.
 
 ## Status
 
 - Read operations verified live: properties, units, leases, tenants, invoices, invoice payments, individual payments, maintenance, and expenses.
 - Write operations are mapped but must only be exercised against an approved real property-management job.
 - Known Innago issue: filtered `GET /v1/payments` may return association/server errors; invoice-specific payment reads work.
+- Innago's ReadMe omits live lease create/edit and application/applicant operations. The CLI includes them from `/openapi/swagger/v1/swagger.json`.
+- The sanctioned OpenAPI does not expose invoice update or delete operations. Existing invoice corrections require Innago's UI.
 
 ## Install
 

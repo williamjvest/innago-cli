@@ -99,11 +99,13 @@ class InnagoCliTests(unittest.TestCase):
         self.assertTrue(mint_token.call_args_list[0].kwargs["use_refresh"])
         self.assertTrue(mint_token.call_args_list[0].kwargs["recoverable"])
 
-    def test_api_request_uses_uppercase_bearer(self):
+    def test_api_request_uses_live_and_documented_auth_headers(self):
         captured = {}
 
         def fake_urlopen(request):
             captured["authorization"] = request.get_header("Authorization")
+            captured["x_api_key"] = request.get_header("X-api-key")
+            captured["token"] = request.get_header("Token")
             return FakeResponse()
 
         credentials = {"client_id": "client", "client_secret": "secret", "x_api_key": "key"}
@@ -116,6 +118,8 @@ class InnagoCliTests(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(captured["authorization"], "Bearer token")
+        self.assertEqual(captured["x_api_key"], "key")
+        self.assertEqual(captured["token"], "key")
 
     def test_token_cache_is_user_only(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -132,15 +136,33 @@ class InnagoCliTests(unittest.TestCase):
         for command in (
             "properties",
             "leases",
+            "lease-create",
+            "lease-edit",
             "tenants",
             "invoices",
             "payments",
             "maintenance",
+            "maintenance-v1",
             "expenses",
+            "applications",
+            "application-settings",
+            "applicant-report",
             "record-ref-payment",
             "sync-payments",
         ):
             self.assertIn(command, help_text)
+
+    def test_applicant_external_reference_is_supported(self):
+        parser = self.cli.build_parser()
+        args = parser.parse_args(["ref", "applicant", "external-id"])
+        self.assertEqual(args.entity, "applicant")
+
+    def test_lease_write_commands_require_json(self):
+        parser = self.cli.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["lease-create"])
+        args = parser.parse_args(["lease-edit", "--json", '{"leaseId":"id"}'])
+        self.assertEqual(args.json, '{"leaseId":"id"}')
 
 
 if __name__ == "__main__":

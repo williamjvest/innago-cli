@@ -4,8 +4,8 @@ innago — CLI wrapper for the Innago Open API.
 
 Reads credentials from environment variables or an optional Agent Vault adapter,
 fetches + caches a 1-hour bearer token (with refresh-token support), and exposes the full Innago Open API surface
-(43 endpoints) as mapped from https://docs.innago.com/reference (authoritative,
-supersedes the integration PDF which had several wrong methods/param names).
+(57 operations) discovered from Innago's live Swagger spec plus the documented
+health endpoint. ReadMe omits lease writes and the application/applicant APIs.
 
 Auth flow (per Innago's integration guide):
   POST /identity/connect/token  grant_type=password
@@ -29,6 +29,8 @@ Usage examples:
   innago unit <propertyUid> <unitUid>
   innago leases [--property <uid>] [--unit <uid>] [--page N]
   innago lease <leaseUid>
+  innago lease-create --json '<CreateLeaseModel>'
+  innago lease-edit --json '<EditLeaseModel>'
   innago tenants --lease <leaseUid>
   innago tenant <tenantUid>
   innago invoices [--lease <uid>] [--tenant <uid>] [--page N]
@@ -53,6 +55,11 @@ Usage examples:
   innago maintenance-delete <maintenanceUid>
   innago maintenance-comment <maintenanceUid> --json '<MaintenanceCommentRequestModel>'
   innago maintenance-email <maintenanceUid> <emailAddress>
+  innago maintenance-v1 [--page N]
+  innago applications [filters]
+  innago application-settings
+  innago applicant <applicantUid>
+  innago applicant-report <applicantUid> <reportType>
   innago map --json '[...]'                       # map external refs to Innago entities
   innago ref <entity> <externalReferenceUid>      # includes maintenance-v2
   innago sync-payments --json '<PaymentSyncRequestModel>'
@@ -243,6 +250,10 @@ def api_request(method, path, query=None, body=None, debug=False):
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("accept", "application/json")
     req.add_header("x-api-key", c["x_api_key"])
+    # Innago's live Swagger calls this header "Token" while its PDF and ReadMe
+    # call it "x-api-key". Supplying both keeps all documented and live-only
+    # endpoints compatible.
+    req.add_header("Token", c["x_api_key"])
     # Innago's OpenAPI implementation incorrectly treats the auth scheme as
     # case-sensitive. The PDF examples use lowercase "bearer", which returns
     # 401 Unauthorized. RFC-correct "Bearer" succeeds.
@@ -334,6 +345,14 @@ def cmd_leases(a):
 
 def cmd_lease(a):
     emit(api_request("GET", f"/v1/leases/{a.lease_uid}", debug=a.debug), a.raw)
+
+def cmd_lease_create(a):
+    emit(api_request("POST", "/v1/leases",
+                     body=load_json_arg(a.json, "CreateLeaseModel"), debug=a.debug), a.raw)
+
+def cmd_lease_edit(a):
+    emit(api_request("PUT", "/v1/leases",
+                     body=load_json_arg(a.json, "EditLeaseModel"), debug=a.debug), a.raw)
 
 # --- Tenant ---
 def cmd_tenants(a):
@@ -430,11 +449,40 @@ def cmd_maintenance_comment(a):
 def cmd_maintenance_email(a):
     emit(api_request("POST", f"/v2/maintenances/{a.maintenance_uid}/emails/{a.email}", debug=a.debug), a.raw)
 
+def cmd_maintenance_v1(a):
+    emit(api_request("GET", "/v1/maintenances", query={"pageNumber": a.page}, debug=a.debug), a.raw)
+
+# --- Applications / applicants (live Swagger; omitted from ReadMe) ---
+def cmd_applications(a):
+    query = {
+        "ApplicantName": a.applicant_name,
+        "ApplicationStatus": a.status,
+        "Decline": a.decline or None,
+        "Accept": a.accept or None,
+        "LowAccept": a.low_accept or None,
+        "Conditional": a.conditional or None,
+        "PropertyUid": a.property,
+        "PageNumber": a.page,
+    }
+    emit(api_request("GET", "/v1/applications", query=query, debug=a.debug), a.raw)
+
+def cmd_application_settings(a):
+    emit(api_request("GET", "/v1/applications/settings", debug=a.debug), a.raw)
+
+def cmd_applicant(a):
+    emit(api_request("GET", f"/v1/applicants/{a.applicant_uid}", debug=a.debug), a.raw)
+
+def cmd_applicant_subresource(a):
+    emit(api_request("GET", f"/v1/applicants/{a.applicant_uid}/{a.subresource}", debug=a.debug), a.raw)
+
+def cmd_applicant_report(a):
+    emit(api_request("GET", f"/v1/applicants/{a.applicant_uid}/reports/{a.report_type}", debug=a.debug), a.raw)
+
 # --- External references / mapping ---
 def cmd_map(a):
     emit(api_request("PUT", "/v1/map", body=load_json_arg(a.json, "map array"), debug=a.debug), a.raw)
 
-REF_ENTITIES = {"property", "propertyunit", "lease", "tenant", "invoice", "payment", "maintenance", "maintenance-v2"}
+REF_ENTITIES = {"property", "propertyunit", "lease", "tenant", "invoice", "payment", "maintenance", "maintenance-v2", "applicant"}
 def cmd_ref(a):
     if a.entity not in REF_ENTITIES:
         die(f"entity must be one of: {', '.join(sorted(REF_ENTITIES))}")
@@ -485,6 +533,8 @@ def build_parser():
     # Lease
     sp = sub.add_parser("leases"); sp.add_argument("--property"); sp.add_argument("--unit"); sp.add_argument("--page", type=int, default=1); sp.set_defaults(func=cmd_leases)
     sp = sub.add_parser("lease"); sp.add_argument("lease_uid"); sp.set_defaults(func=cmd_lease)
+    sp = sub.add_parser("lease-create"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_lease_create)
+    sp = sub.add_parser("lease-edit"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_lease_edit)
 
     # Tenant
     sp = sub.add_parser("tenants"); sp.add_argument("--lease", required=True); sp.set_defaults(func=cmd_tenants)
@@ -527,6 +577,28 @@ def build_parser():
     sp = sub.add_parser("maintenance-delete"); sp.add_argument("maintenance_uid"); sp.set_defaults(func=cmd_maintenance_delete)
     sp = sub.add_parser("maintenance-comment"); sp.add_argument("maintenance_uid"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_maintenance_comment)
     sp = sub.add_parser("maintenance-email"); sp.add_argument("maintenance_uid"); sp.add_argument("email"); sp.set_defaults(func=cmd_maintenance_email)
+    sp = sub.add_parser("maintenance-v1"); sp.add_argument("--page", type=int, default=1); sp.set_defaults(func=cmd_maintenance_v1)
+
+    # Applications / applicants
+    sp = sub.add_parser("applications")
+    sp.add_argument("--applicant-name"); sp.add_argument("--status", type=int)
+    sp.add_argument("--decline", action="store_true"); sp.add_argument("--accept", action="store_true")
+    sp.add_argument("--low-accept", action="store_true"); sp.add_argument("--conditional", action="store_true")
+    sp.add_argument("--property"); sp.add_argument("--page", type=int, default=1)
+    sp.set_defaults(func=cmd_applications)
+    sub.add_parser("application-settings").set_defaults(func=cmd_application_settings)
+    sp = sub.add_parser("applicant"); sp.add_argument("applicant_uid"); sp.set_defaults(func=cmd_applicant)
+    for command, subresource in (
+        ("applicant-coapplicants", "coapplicants"),
+        ("applicant-customdetails", "customdetails"),
+        ("applicant-emergencycontacts", "emergencycontacts"),
+        ("applicant-employmenthistory", "employmenthistory"),
+        ("applicant-references", "references"),
+        ("applicant-rentalhistory", "rentalhistory"),
+    ):
+        sp = sub.add_parser(command); sp.add_argument("applicant_uid")
+        sp.set_defaults(func=cmd_applicant_subresource, subresource=subresource)
+    sp = sub.add_parser("applicant-report"); sp.add_argument("applicant_uid"); sp.add_argument("report_type", type=int); sp.set_defaults(func=cmd_applicant_report)
 
     # External refs / mapping
     sp = sub.add_parser("map"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_map)
