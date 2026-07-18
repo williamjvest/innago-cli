@@ -44,6 +44,21 @@ If [`agent-vault`](https://github.com/williamjvest/agent-vault) is installed, se
 
 Environment variables take precedence. Credentials never live in this repository. The access and refresh-token cache is stored at `~/.cache/innago/token.json` with mode `0600`.
 
+### Requesting OpenAPI access from Innago
+
+OpenAPI credentials are not self-service in the Innago dashboard. Email **[support@innago.com](mailto:support@innago.com)** with the subject **`API Key Request`** and ask them to enable OpenAPI access for your property-owner account.
+
+Ask for the complete credential set and current integration guide:
+
+- Client ID
+- Client Secret
+- X-Api-Key
+- Current OpenAPI/PDF integration guide
+
+In the account used to develop this CLI, the initial request went to `support@innago.com`; support representative Deepanshu Monga escalated it internally and returned the credentials from that same support address. Treat the shared support inbox as the durable contact rather than relying on a specific representative.
+
+Do not send credentials back over email or commit them to a repository. Store them in environment variables or a secret manager as described above.
+
 ## Authentication
 
 Innago's integration guide uses a service-account password grant:
@@ -70,6 +85,8 @@ See [`docs/solutions/integration-issues/innago-lowercase-bearer-authorization-20
 
 ```bash
 innago auth
+innago token                 # status only
+innago token --show          # deliberately print bearer token
 innago health
 innago properties
 innago units <propertyUid>
@@ -112,6 +129,7 @@ innago portal import-state ~/.playwright-auth/innago.json
 innago portal invoice-get 12345678
 innago portal invoice-delete 12345678 --confirm 12345678
 innago portal raw GET /api/some/private/path
+innago portal raw POST /api/some/private/path --json '{...}' --confirm-write
 ```
 
 Invoice deletion mirrors Innago's own portal behavior. Bizarrely, its private endpoint uses an HTTP `GET` for the destructive action. The exact numeric invoice ID must be repeated with `--confirm`.
@@ -121,6 +139,8 @@ Private endpoints are not official, versioned, or promised stable by Innago. The
 ## Write safety
 
 Commands that create, alter, record, reject, cancel, sync, or delete data are real production operations. Do not use them as synthetic tests. Validate writes only against an actual approved job, confirm the payload against current API docs or observed portal behavior, execute once, then read the resulting resource back.
+
+Dedicated delete commands require repeating the target ID with `--confirm`. Generic `raw` commands require `--confirm-write` for non-read HTTP methods. Known invoice-delete portal paths are blocked from `portal raw` entirely so they cannot bypass the stronger confirmation check.
 
 ## Development
 

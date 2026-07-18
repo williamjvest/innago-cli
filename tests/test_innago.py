@@ -1,11 +1,13 @@
 import importlib.machinery
 import importlib.util
 import base64
+import io
 import json
 import os
 import stat
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -122,6 +124,23 @@ class InnagoCliTests(unittest.TestCase):
         self.assertEqual(captured["x_api_key"], "key")
         self.assertEqual(captured["token"], "key")
 
+    def test_api_request_refreshes_once_after_401(self):
+        credentials = {"client_id": "client", "client_secret": "secret", "x_api_key": "key"}
+        rejected = self.cli.urllib.error.HTTPError(
+            "https://api-my.innago.com/openapi/v1/health", 401, "Unauthorized", {}, io.BytesIO(b"{}")
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            self.cli.CACHE_PATH = str(Path(directory) / "token.json")
+            with (
+                patch.object(self.cli, "creds", return_value=credentials),
+                patch.object(self.cli, "get_token", side_effect=["old", "new"]) as token,
+                patch.object(self.cli.urllib.request, "urlopen", side_effect=[rejected, FakeResponse()]),
+            ):
+                result = self.cli.api_request("GET", "/v1/health")
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(token.call_count, 2)
+
     def test_token_cache_is_user_only(self):
         with tempfile.TemporaryDirectory() as directory:
             cache_path = Path(directory) / "token.json"
@@ -153,6 +172,31 @@ class InnagoCliTests(unittest.TestCase):
             self.assertEqual(result["api_token"], "property-owner-token")
             self.assertNotIn("google-secret", cache_path.read_text())
             self.assertEqual(stat.S_IMODE(os.stat(cache_path).st_mode), 0o600)
+
+    def test_portal_state_import_rejects_expired_token(self):
+        payload = base64.urlsafe_b64encode(json.dumps({"exp": 1}).encode()).decode().rstrip("=")
+        state = {"cookies": [
+            {"name": "AuthorizationToken_prod", "value": f"header.{payload}.signature", "domain": ".innago.com"},
+            {"name": "APIToken_prod", "value": "property-owner-token", "domain": ".innago.com"},
+        ]}
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            self.cli.PORTAL_CACHE_PATH = str(Path(directory) / "portal.json")
+            state_path.write_text(json.dumps(state))
+            with self.assertRaises(SystemExit):
+                self.cli.portal_import_state(str(state_path))
+
+    def test_token_command_hides_bearer_without_show(self):
+        parser = self.cli.build_parser()
+        args = parser.parse_args(["--raw", "token"])
+        output = io.StringIO()
+        with (
+            patch.object(self.cli, "get_token", return_value="secret-bearer"),
+            patch.object(self.cli, "load_cache", return_value={"expires_at": self.cli.time.time() + 3600}),
+            redirect_stdout(output),
+        ):
+            args.func(args)
+        self.assertNotIn("secret-bearer", output.getvalue())
 
     def test_portal_request_uses_browser_session_headers(self):
         captured = {}
@@ -201,14 +245,43 @@ class InnagoCliTests(unittest.TestCase):
 
     def test_portal_raw_cannot_bypass_invoice_delete_confirmation(self):
         parser = self.cli.build_parser()
-        args = parser.parse_args([
-            "portal", "raw", "GET",
+        paths = (
             "/api/Finance/InvoiceDelete/DeleteInvoiceById?invoiceId=123",
-        ])
-        with (
-            patch.object(self.cli, "portal_request") as request,
-            self.assertRaises(SystemExit),
-        ):
+            "/api/finance/invoicedelete/deleteinvoicebyid?invoiceId=123",
+            "/api/Finance/Invoice%44elete/DeleteInvoiceById?invoiceId=123",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                args = parser.parse_args(["portal", "raw", "GET", path])
+                with (
+                    patch.object(self.cli, "portal_request") as request,
+                    self.assertRaises(SystemExit),
+                ):
+                    args.func(args)
+                request.assert_not_called()
+
+    def test_portal_delete_requires_positive_data_confirmation(self):
+        parser = self.cli.build_parser()
+        args = parser.parse_args(["portal", "invoice-delete", "123", "--confirm", "123"])
+        response = {"ModelValidation": {"IsValid": True}, "Data": False}
+        with patch.object(self.cli, "portal_request", return_value=response), self.assertRaises(SystemExit):
+            args.func(args)
+
+    def test_raw_write_requires_confirmation_and_handles_bad_json(self):
+        parser = self.cli.build_parser()
+        args = parser.parse_args(["raw", "POST", "/v1/test", "--json", "{}"])
+        with patch.object(self.cli, "api_request") as request, self.assertRaises(SystemExit):
+            args.func(args)
+        request.assert_not_called()
+
+        args = parser.parse_args(["raw", "POST", "/v1/test", "--json", "not-json", "--confirm-write"])
+        with self.assertRaises(SystemExit):
+            args.func(args)
+
+    def test_maintenance_delete_requires_exact_confirmation(self):
+        parser = self.cli.build_parser()
+        args = parser.parse_args(["maintenance-delete", "uid", "--confirm", "wrong"])
+        with patch.object(self.cli, "api_request") as request, self.assertRaises(SystemExit):
             args.func(args)
         request.assert_not_called()
 

@@ -52,7 +52,7 @@ Usage examples:
   innago maintenance-create --json '<MaintenanceRequestModel>'
   innago maintenance-edit <maintenanceUid> --json '<EditMaintenanceRequestModel>'
   innago maintenance-status <maintenanceUid> <statusCode>
-  innago maintenance-delete <maintenanceUid>
+  innago maintenance-delete <maintenanceUid> --confirm <maintenanceUid>
   innago maintenance-comment <maintenanceUid> --json '<MaintenanceCommentRequestModel>'
   innago maintenance-email <maintenanceUid> <emailAddress>
   innago maintenance-v1 [--page N]
@@ -66,12 +66,12 @@ Usage examples:
   innago sync-invoices --json '[...]'
   innago sync-status <syncRequestId>
   innago health
-  innago raw <METHOD> <path> [--json '<body>']    # escape hatch
+  innago raw <METHOD> <path> [--json '<body>'] [--confirm-write]
   innago portal login                              # opens real Innago login
   innago portal capture                            # saves only Innago tokens
   innago portal invoice-get <numericInvoiceId>
   innago portal invoice-delete <id> --confirm <id>
-  innago portal raw <METHOD> <path> [--json '<body>']
+  innago portal raw <METHOD> <path> [--json '<body>'] [--confirm-write]
 
 Global flags (BEFORE the subcommand): --raw  --debug
 """
@@ -248,7 +248,7 @@ def get_token(debug=False):
 # API request
 # --------------------------------------------------------------------------- #
 
-def api_request(method, path, query=None, body=None, debug=False):
+def api_request(method, path, query=None, body=None, debug=False, _retry_auth=True):
     c = creds()
     token = get_token(debug=debug)
     url = BASE_URL + path
@@ -289,6 +289,16 @@ def api_request(method, path, query=None, body=None, debug=False):
             except json.JSONDecodeError:
                 return {"status": resp.status, "body": raw}
     except urllib.error.HTTPError as e:
+        if e.code == 401 and _retry_auth:
+            e.close()
+            try:
+                os.remove(CACHE_PATH)
+            except FileNotFoundError:
+                pass
+            if debug:
+                print("[debug] OpenAPI token rejected; refreshing once", file=sys.stderr)
+            return api_request(method, path, query=query, body=body, debug=debug,
+                               _retry_auth=False)
         die(f"{method} {path} failed: HTTP {e.code}\n{e.read().decode(errors='ignore')}")
     except urllib.error.URLError as e:
         die(f"{method} {path} network error: {e}")
@@ -327,10 +337,13 @@ def portal_cache_from_tokens(access_token, api_token):
     if access_token.startswith("Bearer "):
         access_token = access_token[7:]
     claims = jwt_claims(access_token)
+    expires_at = claims.get("exp", 0)
+    if not expires_at or expires_at <= time.time() + EXPIRY_SKEW_SECONDS:
+        die("captured Innago portal token is missing an expiry or already expired")
     cache = {
         "access_token": access_token,
         "api_token": api_token,
-        "expires_at": claims.get("exp", 0),
+        "expires_at": expires_at,
         "captured_at": int(time.time()),
     }
     save_portal_cache(cache)
@@ -424,6 +437,10 @@ def portal_request(method, path, query=None, body=None, debug=False):
                 return {"status": resp.status, "body": raw}
     except urllib.error.HTTPError as error:
         if error.code in (401, 403):
+            try:
+                os.remove(PORTAL_CACHE_PATH)
+            except FileNotFoundError:
+                pass
             die("portal session rejected; run `innago portal login`, sign in, then `innago portal capture`")
         die(f"portal {method} {path} failed: HTTP {error.code}\n{error.read().decode(errors='ignore')}")
     except urllib.error.URLError as error:
@@ -458,13 +475,31 @@ def load_json_arg(s, what="body"):
 
 def cmd_auth(a):
     cache = mint_token(debug=a.debug)
+    result = {
+        "cached": True,
+        "expiresInSeconds": int(cache["expires_at"] - time.time()),
+        "hasRefreshToken": bool(cache.get("refresh_token")),
+    }
+    if a.raw:
+        emit(result, True)
+        return
     print(f"ok — token cached, valid ~{int(cache['expires_at'] - time.time())}s")
     if cache.get("refresh_token"):
         print("refresh token stored (~1 month)")
 
 
 def cmd_token(a):
-    print(get_token(debug=a.debug))
+    token = get_token(debug=a.debug)
+    if a.show:
+        print(token)
+        return
+    cache = load_cache()
+    emit({
+        "cached": True,
+        "expiresAt": cache.get("expires_at"),
+        "expiresInSeconds": max(0, int(cache.get("expires_at", 0) - time.time())),
+        "hint": "pass --show to print the bearer token",
+    }, a.raw)
 
 
 def cmd_health(a):
@@ -587,6 +622,8 @@ def cmd_maintenance_status(a):
     emit(api_request("PATCH", f"/v2/maintenances/{a.maintenance_uid}/status/{a.status_code}", debug=a.debug), a.raw)
 
 def cmd_maintenance_delete(a):
+    if a.confirm != a.maintenance_uid:
+        die(f"refusing delete: pass --confirm {a.maintenance_uid}")
     emit(api_request("DELETE", f"/v2/maintenances/{a.maintenance_uid}", debug=a.debug), a.raw)
 
 def cmd_maintenance_comment(a):
@@ -663,8 +700,12 @@ def cmd_portal_login(a):
         subprocess.run(command, check=True)
     except subprocess.CalledProcessError as error:
         die(f"could not open Innago login browser: {error}")
-    print("Innago login opened. Sign in, then run:")
-    print(f"  innago portal capture --session {session}")
+    next_command = f"innago portal capture --session {session}"
+    if a.raw:
+        emit({"opened": True, "session": session, "nextCommand": next_command}, True)
+    else:
+        print("Innago login opened. Sign in, then run:")
+        print(f"  {next_command}")
 
 
 def cmd_portal_capture(a):
@@ -682,20 +723,26 @@ def cmd_portal_capture(a):
         subprocess.run(["playwright-cli", f"-s={session}", "close"],
                        capture_output=True, text=True)
     remaining = max(0, int(cache.get("expires_at", 0) - time.time()))
-    print(f"ok — portal session cached, valid ~{remaining}s")
+    if a.raw:
+        emit({"cached": True, "expiresInSeconds": remaining}, True)
+    else:
+        print(f"ok — portal session cached, valid ~{remaining}s")
 
 
 def cmd_portal_import_state(a):
     cache = portal_import_state(a.path)
     remaining = max(0, int(cache.get("expires_at", 0) - time.time()))
-    print(f"ok — portal session imported, valid ~{remaining}s")
+    if a.raw:
+        emit({"cached": True, "expiresInSeconds": remaining}, True)
+    else:
+        print(f"ok — portal session imported, valid ~{remaining}s")
 
 
 def cmd_portal_auth(a):
     cache = get_portal_cache()
     claims = jwt_claims(cache["access_token"])
     result = {
-        "authenticated": True,
+        "cached": True,
         "expiresAt": cache.get("expires_at"),
         "expiresInSeconds": max(0, int(cache.get("expires_at", 0) - time.time())),
         "propertyOwnerId": claims.get("https://my.innago.com/PropertyOwnerId"),
@@ -717,20 +764,31 @@ def cmd_portal_invoice_delete(a):
     # is private and browser-session authenticated, not part of OpenAPI.
     result = portal_request("GET", "/api/Finance/InvoiceDelete/DeleteInvoiceById",
                             query={"invoiceId": a.invoice_id}, debug=a.debug)
+    valid = result.get("ModelValidation", {}).get("IsValid") if isinstance(result, dict) else None
+    data = result.get("Data") if isinstance(result, dict) else None
+    if valid is False or data is not True:
+        die(f"portal delete returned an unrecognized response: {json.dumps(result)}")
     emit({"invoiceId": a.invoice_id, "deleted": True, "response": result}, a.raw)
 
 
 def cmd_portal_raw(a):
-    if "/InvoiceDelete/" in a.path:
+    normalized_path = urllib.parse.unquote(a.path).lower()
+    if "invoicedelete" in normalized_path or "deleteinvoicebyid" in normalized_path:
         die("use `innago portal invoice-delete <id> --confirm <id>` for invoice deletion")
+    method = a.method.upper()
+    if method not in ("GET", "HEAD", "OPTIONS") and not a.confirm_write:
+        die("private portal writes require --confirm-write")
     body = load_json_arg(a.json) if a.json else None
-    emit(portal_request(a.method.upper(), a.path, body=body, debug=a.debug), a.raw)
+    emit(portal_request(method, a.path, body=body, debug=a.debug), a.raw)
 
 
 # --- Raw escape hatch ---
 def cmd_raw(a):
-    body = json.loads(a.json) if a.json else None
-    emit(api_request(a.method.upper(), a.path, body=body, debug=a.debug), a.raw)
+    method = a.method.upper()
+    if method not in ("GET", "HEAD", "OPTIONS") and not a.confirm_write:
+        die("OpenAPI raw writes require --confirm-write")
+    body = load_json_arg(a.json) if a.json else None
+    emit(api_request(method, a.path, body=body, debug=a.debug), a.raw)
 
 
 # --------------------------------------------------------------------------- #
@@ -744,7 +802,7 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("auth").set_defaults(func=cmd_auth)
-    sub.add_parser("token").set_defaults(func=cmd_token)
+    sp = sub.add_parser("token"); sp.add_argument("--show", action="store_true"); sp.set_defaults(func=cmd_token)
     sub.add_parser("health").set_defaults(func=cmd_health)
 
     # Property
@@ -797,7 +855,7 @@ def build_parser():
     sp = sub.add_parser("maintenance-create"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_maintenance_create)
     sp = sub.add_parser("maintenance-edit"); sp.add_argument("maintenance_uid"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_maintenance_edit)
     sp = sub.add_parser("maintenance-status"); sp.add_argument("maintenance_uid"); sp.add_argument("status_code"); sp.set_defaults(func=cmd_maintenance_status)
-    sp = sub.add_parser("maintenance-delete"); sp.add_argument("maintenance_uid"); sp.set_defaults(func=cmd_maintenance_delete)
+    sp = sub.add_parser("maintenance-delete"); sp.add_argument("maintenance_uid"); sp.add_argument("--confirm", required=True); sp.set_defaults(func=cmd_maintenance_delete)
     sp = sub.add_parser("maintenance-comment"); sp.add_argument("maintenance_uid"); sp.add_argument("--json", required=True); sp.set_defaults(func=cmd_maintenance_comment)
     sp = sub.add_parser("maintenance-email"); sp.add_argument("maintenance_uid"); sp.add_argument("email"); sp.set_defaults(func=cmd_maintenance_email)
     sp = sub.add_parser("maintenance-v1"); sp.add_argument("--page", type=int, default=1); sp.set_defaults(func=cmd_maintenance_v1)
@@ -833,7 +891,7 @@ def build_parser():
     sp = sub.add_parser("sync-status"); sp.add_argument("sync_request_id"); sp.set_defaults(func=cmd_sync_status)
 
     # Raw
-    sp = sub.add_parser("raw"); sp.add_argument("method"); sp.add_argument("path"); sp.add_argument("--json"); sp.set_defaults(func=cmd_raw)
+    sp = sub.add_parser("raw"); sp.add_argument("method"); sp.add_argument("path"); sp.add_argument("--json"); sp.add_argument("--confirm-write", action="store_true"); sp.set_defaults(func=cmd_raw)
 
     # Optional browser-session portal adapter. Private/undocumented endpoints
     # stay isolated from the sanctioned OpenAPI command surface.
@@ -853,7 +911,7 @@ def build_parser():
     sp.add_argument("invoice_id", type=int); sp.add_argument("--confirm", required=True)
     sp.set_defaults(func=cmd_portal_invoice_delete)
     sp = portal_sub.add_parser("raw", help="call another private portal path")
-    sp.add_argument("method"); sp.add_argument("path"); sp.add_argument("--json")
+    sp.add_argument("method"); sp.add_argument("path"); sp.add_argument("--json"); sp.add_argument("--confirm-write", action="store_true")
     sp.set_defaults(func=cmd_portal_raw)
 
     return p
